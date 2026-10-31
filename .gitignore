@@ -1,0 +1,61 @@
+# Secrets — never commit these
+.env
+config/config.toml
+config/profiles.toml
+config/auth-profiles.json
+config/*token*.json
+config/*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+.pytest_cache/
+.pytest-tmp/
+*.egg-info/
+dist/
+build/
+
+# Runtime data — every install starts with a clean slate
+workspace/
+state/
+/memory/
+logs/
+*.log
+*.log.*
+
+# Thrall's learned lessons and personality profiles are per-user
+identity/experience.md
+identity/backup/
+identity/profiles/*
+!identity/profiles/example.md
+docs/
+
+# Local agent catalog
+components/agents/catalog/
+
+# Stray data files in the project root
+/*.csv
+/*.pdf
+/*_summary.txt
+/*.png
+
+# Frontend
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# Local placeholders for planned features (kept on disk, not published)
+server/adapter.py
+utils/
+transports/discord/
+transports/slack/
+services/memory/backends/postgres.py

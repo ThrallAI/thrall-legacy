@@ -1,0 +1,159 @@
+[thrall]
+name = "Thrall"
+version = "2.0.0"
+workspace_dir = "workspace"
+
+[user]
+github_username = "your-github-username"
+
+
+[llm]
+provider = "openrouter"
+model = "google/gemini-2.5-flash"
+temperature = 0.7
+max_tokens = 8192
+# reasoning_effort = "high"   # "low" | "medium" | "high" — enables reasoning/thinking for supported models
+
+[llm.providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[llm.providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[llm.providers.anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.providers.google]
+api_key_env = "GOOGLE_API_KEY"
+
+[memory]
+episode_backend = "session"        # session | redis
+fact_backend = "session"           # session | qdrant
+auto_compact_threshold = 200000    # tokens — 0 to disable auto-compact
+episodic_ttl_days = 7              # how long episodes live in Redis
+synthesis_interval = "6h"         # how often episodic → semantic synthesis runs
+
+[memory.redis]
+url = "redis://localhost:6379"
+
+[memory.qdrant]
+url = "http://localhost:6333"
+
+# ── Agent model tiers ─────────────────────────────────────────────────────────
+# Models assigned to generated agents by task complexity.
+# tier_capable   — research, code execution, analysis, multi-step reasoning
+# tier_lightweight — summarisation, formatting, simple classification
+[agents]
+tier_capable     = "google/gemini-2.5-flash"
+tier_lightweight = "google/gemini-2.0-flash-lite"
+
+[transports.telegram]
+enabled = true
+# Your Telegram user id (a number — message @userinfobot on Telegram to get it), e.g. [123456789].
+# Empty = nobody can use the bot; Thrall starts without Telegram and tells you to add it.
+allowed_user_ids = []
+
+[transports.cli]
+enabled = true
+
+[transports.desktop]
+enabled = true
+# Set THRALL_DESKTOP_TOKEN env var to require token auth on the /ws endpoint.
+# Leave unset for open access (dev mode only — always set a token in production).
+
+[transports.discord]
+enabled = false
+
+[transports.slack]
+enabled = false
+
+[security]
+sanitize_web_content = true
+sanitize_file_content = true
+audit_log = true
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+# ── MCP Servers ───────────────────────────────────────────────────────────────
+# Any MCP-compatible server can be added here.
+# Set enabled = true and fill credentials to activate.
+
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "gmail"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-gmail"]
+env = {}
+enabled = false
+
+[[mcp.servers]]
+name = "google-calendar"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-google-calendar"]
+env = {}
+enabled = false
+
+[[mcp.servers]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = {}
+enabled = false
+
+[[mcp.servers]]
+name = "google-drive"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-gdrive"]
+env = {}
+enabled = false
+
+[[mcp.servers]]
+name = "brave-search"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-brave-search"]
+env = { BRAVE_API_KEY = "" }
+enabled = false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# One rotating file per process (logs/thrall.log, logs/thrall-main.log), 20 MB x 5.
+# INFO for normal use; DEBUG adds per-step LLM token/cost lines for development.
+[logging]
+level = "INFO"
+
+# ── Skills ───────────────────────────────────────────────────────────────────
+# Folders containing SKILL.md (frontmatter name + description, then instructions).
+# Searched up to 4 levels deep. Relative paths are relative to the Thrall root.
+# A one-line catalog goes into context; skill_load pulls in the full instructions.
+[skills]
+dirs = ["skills"]
+ignore = []
+
+# ── Harness ──────────────────────────────────────────────────────────────────
+# action_footer: add a line to replies listing what was actually changed this turn,
+# built from the tool record (not written by the model). Off by default.
+[harness]
+action_footer = false
+
+# ── Permissions ──────────────────────────────────────────────────────────────
+# mode: ask (reads run freely; anything that changes something asks you first),
+#       trusted (everything runs), read_only (nothing that changes anything).
+# Release default: ask. Use trusted only on a machine you alone control.
+# Rules: "tool_glob" or "tool_glob:arg_glob" — deny always wins. Examples:
+#   allow = ["shell_run:git status*", "filesystem_write:workspace/**", "deckcraft__*"]
+#   deny  = ["powershell_run:*Remove-Item*"]
+# Change at runtime with /permissions ask | trusted | read_only | reset.
+[permissions]
+mode = "ask"
+allow = []
+deny = []

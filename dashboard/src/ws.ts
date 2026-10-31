@@ -1,0 +1,114 @@
+export type WsStatus = 'disconnected' | 'connecting' | 'ready' | 'typing';
+
+type InboundFrame =
+  | { type: 'ready'; session_id: string }
+  | { type: 'typing'; session_id?: string }
+  | { type: 'response'; content: string; reasoning: string | null; session_id?: string }
+  | { type: 'sync'; role: 'user' | 'assistant'; content: string }
+  | { type: 'progress'; text: string; session_id?: string }
+  | { type: 'notice'; content: string; session_id?: string }
+  | { type: 'pong' }
+  | { type: 'error'; message: string };
+
+export interface WsCallbacks {
+  onStatus: (s: WsStatus) => void;
+  onTyping: (sessionId: string | null) => void;
+  onMessage: (content: string, sessionId: string | null) => void;
+  onSync: (role: 'user' | 'assistant', content: string) => void;
+  /** A live step while Thrall works ("deckcraft: add slide"). */
+  onProgress: (text: string, sessionId: string | null) => void;
+  /** A message that doesn't end the task (permission question, "got it" for a mid-task message). */
+  onNotice: (content: string, sessionId: string | null) => void;
+  onError: (msg: string) => void;
+  onSessionId: (id: string) => void;
+}
+
+export interface WsClient {
+  connect: () => void;
+  send: (content: string, sessionId?: string) => void;
+  disconnect: () => void;
+}
+
+export function createWsClient(token: string, callbacks: WsCallbacks): WsClient {
+  let ws: WebSocket | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let destroyed = false;
+
+  function connect() {
+    if (destroyed) return;
+    callbacks.onStatus('connecting');
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      ws!.send(JSON.stringify({ type: 'auth', token }));
+    };
+
+    ws.onmessage = (e: MessageEvent<string>) => {
+      let frame: InboundFrame;
+      try {
+        frame = JSON.parse(e.data) as InboundFrame;
+      } catch {
+        return;
+      }
+
+      if (frame.type === 'ready') {
+        callbacks.onSessionId(frame.session_id);
+        callbacks.onStatus('ready');
+        pingTimer = setInterval(() => {
+          ws?.send(JSON.stringify({ type: 'ping' }));
+        }, 25_000);
+      } else if (frame.type === 'typing') {
+        callbacks.onTyping(frame.session_id ?? null);
+      } else if (frame.type === 'response') {
+        callbacks.onMessage(frame.content, frame.session_id ?? null);
+        callbacks.onStatus('ready');
+      } else if (frame.type === 'sync') {
+        callbacks.onSync(frame.role, frame.content);
+      } else if (frame.type === 'progress') {
+        callbacks.onProgress(frame.text, frame.session_id ?? null);
+      } else if (frame.type === 'notice') {
+        callbacks.onNotice(frame.content, frame.session_id ?? null);
+      } else if (frame.type === 'error') {
+        callbacks.onError(frame.message);
+        callbacks.onStatus('ready');
+      }
+      // pong: no-op
+    };
+
+    ws.onclose = () => {
+      _clearTimers();
+      if (!destroyed) {
+        callbacks.onStatus('disconnected');
+        reconnectTimer = setTimeout(connect, 3_000);
+      }
+    };
+
+    ws.onerror = () => {
+      ws?.close();
+    };
+  }
+
+  function send(content: string, sessionId?: string) {
+    if (ws?.readyState === WebSocket.OPEN) {
+      const payload: Record<string, string> = { type: 'message', content };
+      if (sessionId) payload.session_id = sessionId;
+      ws.send(JSON.stringify(payload));
+    }
+  }
+
+  function disconnect() {
+    destroyed = true;
+    _clearTimers();
+    ws?.close();
+  }
+
+  function _clearTimers() {
+    if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  }
+
+  return { connect, send, disconnect };
+}

@@ -1,0 +1,71 @@
+﻿from __future__ import annotations
+from uuid import UUID
+from schemas.tool import ToolCall, ToolResult
+from services import session_memory
+from thrall.tools.filesystem._resolve import resolve, is_protected
+from constants.tools import CODE_EXTS
+import time
+
+
+def execute(call: ToolCall) -> ToolResult:
+    start = time.monotonic()
+    path = resolve(call.args.get("path", ""))
+    old = call.args.get("old_string", "")
+    new = call.args.get("new_string", "")
+    replace_all = call.args.get("replace_all", False)
+
+    try:
+        if is_protected(path) or not path.exists():
+            return _result(call.id, error=f"file not found: {path}", start=start)
+
+        # Edit guard — only edit what this session has read, and only if unchanged since
+        blocked = session_memory.edit_blocked_reason(call.session_id, path)
+        if blocked:
+            return _result(call.id, error=blocked, start=start)
+
+        content = path.read_text(encoding="utf-8")
+
+        if old not in content:
+            return _result(call.id, error="old_string not found in file", start=start)
+
+        count = content.count(old)
+        if count > 1 and not replace_all:
+            return _result(
+                call.id,
+                error=f"old_string appears {count} times — set replace_all=true or provide more context",
+                start=start,
+            )
+
+        updated = content.replace(old, new) if replace_all else content.replace(old, new, 1)
+        path.write_text(updated, encoding="utf-8")
+        session_memory.note_file_seen(call.session_id, path)  # further edits allowed without re-reading
+        replacements = count if replace_all else 1
+        msg = f"replaced {replacements} occurrence(s) in {path}\n[Verify with filesystem_ls before reporting completion."
+        if path.suffix in CODE_EXTS:
+            msg += " This is a code file — re-read it and check for: string interpolation in shell/subprocess calls, hardcoded paths, argument escaping, and logic errors before reporting done."
+        msg += "]"
+        return _result(call.id, output=msg, start=start)
+
+    except PermissionError:
+        return _result(call.id, error=f"permission denied: {path}", start=start)
+    except Exception as e:
+        return _result(call.id, error=str(e), start=start)
+
+
+def _result(call_id: UUID, start: float, output: str | None = None, error: str | None = None) -> ToolResult:
+    return ToolResult(
+        call_id=call_id,
+        output=output,
+        error=error,
+        duration_ms=int((time.monotonic() - start) * 1000),
+    )
+
+
+NAME = "filesystem_edit"
+DESCRIPTION = "Replace a string in a file. Exact match required."
+PARAMETERS = {
+    "path": {"type": "string", "required": True},
+    "old_string": {"type": "string", "required": True},
+    "new_string": {"type": "string", "required": True},
+    "replace_all": {"type": "boolean", "required": False, "default": False},
+}

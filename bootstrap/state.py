@@ -1,0 +1,314 @@
+from __future__ import annotations
+import asyncio
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+_COST_FILE = os.path.join(os.path.dirname(__file__), "..", "state", "cost.json")
+
+# DAG LEAF — imports nothing from this project. stdlib only.
+# Every module that needs shared runtime state imports from here.
+# DO NOT ADD STATE LIGHTLY. Think three times before adding a field.
+
+
+@dataclass
+class _ModelUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass
+class _State:
+    session_id: UUID = field(default_factory=uuid4)
+    start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_interaction: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # Runtime
+    client_type: str = "cli"
+    is_interactive: bool = False
+    cwd: str = ""
+
+    # Cost + token tracking
+    model_usage: dict[str, _ModelUsage] = field(default_factory=dict)
+    session_costs: dict[str, float] = field(default_factory=dict)
+    total_cost_usd: float = 0.0
+
+    # Active tasks
+    active_task_count: int = 0
+
+    # Config (loaded at startup, read-only after that)
+    config: dict = field(default_factory=dict)
+
+    # In-memory error log (capped at 100)
+    error_log: list[dict] = field(default_factory=list)
+
+    # Registered hook callbacks keyed by gate name
+    registered_hooks: dict[str, list] = field(default_factory=dict)
+
+    # Model override (set by user or Thrall mid-session)
+    model_override: str | None = None
+
+    # Reasoning effort override ("low" | "medium" | "high" | None = use config)
+    reasoning_effort_override: str | None = None
+
+    # Permission mode override from /permissions ("ask" | "trusted" | "read_only" | None = use config)
+    permission_mode_override: str | None = None
+
+    # Log file this process writes (logs/<name>), set at startup
+    log_file: str | None = None
+
+    # Default working directory for relative filesystem paths
+    workspace_dir: str = ""
+
+    # Identity file baseline: filename → (content, sha256_hash) — set once at startup
+    identity_baseline: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+    # Active personality profile
+    active_profile: str = "default"
+    active_profile_content: str | None = None
+
+    # Active LLM profile (set by /model @profile — separate from personality profile)
+    active_llm_profile: str | None = None
+
+    # Active reasoning tasks per session — keyed by session_id string
+    active_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+
+
+_STATE = _State()
+
+
+# ── Session ──────────────────────────────────────────────────────────────────
+
+def get_session_id() -> UUID:
+    return _STATE.session_id
+
+def new_session() -> UUID:
+    _STATE.session_id = uuid4()
+    return _STATE.session_id
+
+
+# ── Client / runtime ─────────────────────────────────────────────────────────
+
+def set_client_type(client: str) -> None:
+    _STATE.client_type = client
+
+def get_client_type() -> str:
+    return _STATE.client_type
+
+def set_interactive(value: bool) -> None:
+    _STATE.is_interactive = value
+
+def get_interactive() -> bool:
+    return _STATE.is_interactive
+
+def set_cwd(cwd: str) -> None:
+    _STATE.cwd = cwd
+
+def get_cwd() -> str:
+    return _STATE.cwd
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def set_config(config: dict) -> None:
+    _STATE.config = config
+
+def get_config() -> dict:
+    return _STATE.config
+
+
+# ── Cost + tokens ─────────────────────────────────────────────────────────────
+
+def _load_cost() -> None:
+    try:
+        with open(_COST_FILE) as f:
+            data = json.load(f)
+        _STATE.total_cost_usd = data.get("total_cost_usd", 0.0)
+        for model, u in data.get("model_usage", {}).items():
+            _STATE.model_usage[model] = _ModelUsage(
+                input_tokens=u.get("input_tokens", 0),
+                output_tokens=u.get("output_tokens", 0),
+                cost_usd=u.get("cost_usd", 0.0),
+            )
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+def _save_cost() -> None:
+    os.makedirs(os.path.dirname(_COST_FILE), exist_ok=True)
+    data = {
+        "total_cost_usd": _STATE.total_cost_usd,
+        "model_usage": {
+            model: {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens, "cost_usd": u.cost_usd}
+            for model, u in _STATE.model_usage.items()
+        },
+    }
+    tmp = _COST_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, _COST_FILE)
+
+def record_usage(model: str, input_tokens: int, output_tokens: int, cost_usd: float, session_id: str | None = None) -> None:
+    if model not in _STATE.model_usage:
+        _STATE.model_usage[model] = _ModelUsage()
+    usage = _STATE.model_usage[model]
+    usage.input_tokens += input_tokens
+    usage.output_tokens += output_tokens
+    usage.cost_usd += cost_usd
+    _STATE.total_cost_usd += cost_usd
+    if session_id:
+        _STATE.session_costs[session_id] = _STATE.session_costs.get(session_id, 0.0) + cost_usd
+    _save_cost()
+
+def get_total_cost() -> float:
+    _load_cost()
+    return _STATE.total_cost_usd
+
+def get_session_cost(session_id: str) -> float:
+    return _STATE.session_costs.get(session_id, 0.0)
+
+def get_model_usage() -> dict[str, _ModelUsage]:
+    _load_cost()
+    return _STATE.model_usage
+
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+
+def increment_tasks() -> None:
+    _STATE.active_task_count += 1
+
+def decrement_tasks() -> None:
+    _STATE.active_task_count = max(0, _STATE.active_task_count - 1)
+
+def get_active_task_count() -> int:
+    return _STATE.active_task_count
+
+
+# ── Model override ────────────────────────────────────────────────────────────
+
+def set_model_override(model: str | None) -> None:
+    _STATE.model_override = model
+
+def get_model_override() -> str | None:
+    return _STATE.model_override
+
+
+def set_log_file(name: str) -> None:
+    """File name (in logs/) this process writes — set once by bootstrap.startup."""
+    _STATE.log_file = name
+
+def get_log_file() -> str | None:
+    return _STATE.log_file
+
+
+def set_permission_mode_override(mode: str | None) -> None:
+    _STATE.permission_mode_override = mode
+
+def get_permission_mode_override() -> str | None:
+    return _STATE.permission_mode_override
+
+
+def set_reasoning_effort(effort: str | None) -> None:
+    _STATE.reasoning_effort_override = effort
+
+def get_reasoning_effort() -> str | None:
+    return _STATE.reasoning_effort_override
+
+
+# ── Workspace dir ─────────────────────────────────────────────────────────────
+
+def set_workspace_dir(path: str) -> None:
+    _STATE.workspace_dir = path
+
+def get_workspace_dir() -> str:
+    return _STATE.workspace_dir
+
+
+# ── Hooks ─────────────────────────────────────────────────────────────────────
+
+def register_hook(gate: str, callback) -> None:
+    if gate not in _STATE.registered_hooks:
+        _STATE.registered_hooks[gate] = []
+    _STATE.registered_hooks[gate].append(callback)
+
+def get_hooks(gate: str) -> list:
+    return _STATE.registered_hooks.get(gate, [])
+
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+
+def log_error(error: str) -> None:
+    _MAX = 100
+    if len(_STATE.error_log) >= _MAX:
+        _STATE.error_log.pop(0)
+    _STATE.error_log.append({
+        "error": error,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+def get_error_log() -> list[dict]:
+    return _STATE.error_log
+
+
+# ── Identity baseline ─────────────────────────────────────────────────────────
+
+def set_identity_baseline(filename: str, content: str, hash_: str) -> None:
+    _STATE.identity_baseline[filename] = (content, hash_)
+
+def get_identity_baseline(filename: str) -> tuple[str, str] | None:
+    return _STATE.identity_baseline.get(filename)
+
+
+# ── Active profile ───────────────────────────────────────────────────────────
+
+def get_active_profile() -> str:
+    return _STATE.active_profile
+
+def set_active_profile(name: str) -> None:
+    _STATE.active_profile = name
+
+def get_active_profile_content() -> str | None:
+    return _STATE.active_profile_content
+
+def set_active_profile_content(content: str | None) -> None:
+    _STATE.active_profile_content = content
+
+
+# ── Active LLM profile ────────────────────────────────────────────────────────
+
+def get_active_llm_profile() -> str | None:
+    return _STATE.active_llm_profile
+
+def set_active_llm_profile(name: str | None) -> None:
+    _STATE.active_llm_profile = name
+
+
+# ── Active reasoning tasks ────────────────────────────────────────────────────
+
+def register_task(session_id: str, task: asyncio.Task) -> None:
+    _STATE.active_tasks[session_id] = task
+
+def unregister_task(session_id: str) -> None:
+    _STATE.active_tasks.pop(session_id, None)
+
+def cancel_task(session_id: str) -> bool:
+    task = _STATE.active_tasks.get(session_id)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+def has_active_task(session_id: str) -> bool:
+    task = _STATE.active_tasks.get(session_id)
+    return task is not None and not task.done()
+
+
+# ── Interaction time ──────────────────────────────────────────────────────────
+
+def touch_interaction() -> None:
+    _STATE.last_interaction = datetime.now(timezone.utc)
+
+def get_last_interaction() -> datetime:
+    return _STATE.last_interaction

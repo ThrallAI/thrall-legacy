@@ -1,0 +1,483 @@
+from __future__ import annotations
+import time
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Optional
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from bootstrap import startup
+from constants.log_files import LOG_FILE_MAIN, LOG_FILE_WEB, LOG_FILE_TELEGRAM, LOG_FILE_ERRORS
+from constants.sync import SYNC_PATH, SYNC_HEADER, SYNC_LOCAL_HOSTS
+import os
+
+# ── Exchange rate cache ───────────────────────────────────────────────────────
+_fx_rate: float = 1.0
+_fx_currency: str = "USD"
+_fx_last_fetch: float = 0.0
+_FX_TTL = 3600  # 1 hour
+
+async def _get_fx_rate(target: str) -> float:
+    global _fx_rate, _fx_currency, _fx_last_fetch
+    if target == "USD":
+        return 1.0
+    now = time.time()
+    if _fx_currency == target and now - _fx_last_fetch < _FX_TTL:
+        return _fx_rate
+    try:
+        import urllib.request
+        url = f"https://api.frankfurter.app/latest?from=USD&to={target}"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            import json
+            data = json.loads(resp.read())
+            rate = float(data["rates"][target])
+            _fx_rate = rate
+            _fx_currency = target
+            _fx_last_fetch = now
+            return rate
+    except Exception:
+        return _fx_rate or 1.0
+
+_START_TIME = time.time()
+
+
+class CreateJobBody(BaseModel):
+    schedule: str
+    task: str
+    type: str = "cron"
+    agent: Optional[str] = None
+    output_mode: str = "verbose"
+
+
+class SetModelBody(BaseModel):
+    model: Optional[str] = None
+
+
+class StopTaskBody(BaseModel):
+    session_id: Optional[str] = None
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    from services.mcp import lifecycle as mcp_lifecycle
+    startup.start()
+    await mcp_lifecycle.start()  # shared with the Telegram bot when both run in one process
+    yield
+    await mcp_lifecycle.stop()
+
+
+app = FastAPI(title="Thrall", version="2.0.0", lifespan=_lifespan)
+
+
+@app.get("/health")
+async def health():
+    from bootstrap import state
+    cfg = state.get_config().get("thrall", {})
+    llm_cfg = state.get_config().get("llm", {})
+    model = state.get_model_override() or llm_cfg.get("model", "unknown")
+    return JSONResponse({
+        "status": "ok",
+        "version": cfg.get("version", "2.0.0"),
+        "model": model,
+    })
+
+
+class SyncBody(BaseModel):
+    role: str
+    content: str
+
+
+@app.post(SYNC_PATH)
+async def internal_sync(body: SyncBody, request: Request):
+    """Telegram process → mirror a message into open webapp windows. Local callers with the shared secret only."""
+    import hmac
+    from services.transport_sync import internal_token
+    from transports.desktop.manager import sync_message
+    expected = internal_token()
+    supplied = request.headers.get(SYNC_HEADER, "")
+    host = request.client.host if request.client else ""
+    if host not in SYNC_LOCAL_HOSTS or not expected or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if body.role not in ("user", "assistant"):
+        return JSONResponse({"error": "bad role"}, status_code=400)
+    await sync_message(body.role, body.content)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/status")
+async def api_status():
+    from bootstrap import state
+    cfg = state.get_config().get("thrall", {})
+    llm_cfg = state.get_config().get("llm", {})
+    model = state.get_model_override() or llm_cfg.get("model", "unknown")
+    config_model = llm_cfg.get("model", "unknown")
+    currency = state.get_config().get("server", {}).get("currency", "USD")
+    cost_usd = state.get_total_cost()
+    fx = await _get_fx_rate(currency)
+    return JSONResponse({
+        "status": "ok",
+        "version": cfg.get("version", "2.0.0"),
+        "model": model,
+        "config_model": config_model,
+        "model_overridden": state.get_model_override() is not None,
+        "tasks": state.get_active_task_count(),
+        "cost_usd": cost_usd,
+        "cost_local": round(cost_usd * fx, 6),
+        "currency": currency,
+        "fx_rate": fx,
+        "uptime_seconds": int(time.time() - _START_TIME),
+        "reasoning_effort": state.get_reasoning_effort(),
+        "errors": len(state.get_error_log()),
+    })
+
+
+@app.get("/api/memory/session")
+async def api_memory_session():
+    from services.session_memory import session_memory
+    result = []
+    for sid in session_memory.all_sessions():
+        context = session_memory.get_context(sid)
+        if context:
+            result.append({
+                "session_id": str(sid),
+                "turns": len(context),
+                "tokens": session_memory.estimate_tokens(sid),
+                "context": context,
+            })
+    return JSONResponse(result)
+
+
+@app.get("/api/memory/episodes")
+async def api_memory_episodes(search: str = "", limit: int = 100):
+    import json
+    from pathlib import Path
+    path = Path(__file__).parent.parent / "memory" / "episodes" / "episodes.jsonl"
+    if not path.exists():
+        return JSONResponse([])
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            pass
+    if search:
+        q = search.lower()
+        entries = [
+            e for e in entries
+            if q in e.get("content", "").lower()
+            or any(q in t.lower() for t in e.get("tags", []))
+        ]
+    entries.reverse()
+    return JSONResponse(entries[:limit])
+
+
+@app.delete("/api/memory/episodes/{episode_id}")
+async def api_delete_episode(episode_id: str):
+    import json
+    from pathlib import Path
+    path = Path(__file__).parent.parent / "memory" / "episodes" / "episodes.jsonl"
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    new_lines, deleted = [], False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            if json.loads(line).get("id") == episode_id:
+                deleted = True
+                continue
+        except Exception:
+            pass
+        new_lines.append(line)
+    if not deleted:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/memory/knowledge")
+async def api_memory_knowledge(search: str = "", limit: int = 100):
+    import json
+    from pathlib import Path
+    path = Path(__file__).parent.parent / "memory" / "knowledge" / "facts.jsonl"
+    if not path.exists():
+        return JSONResponse([])
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            pass
+    if search:
+        q = search.lower()
+        entries = [
+            e for e in entries
+            if q in e.get("content", "").lower()
+            or any(q in t.lower() for t in e.get("tags", []))
+        ]
+    entries.reverse()
+    return JSONResponse(entries[:limit])
+
+
+@app.delete("/api/memory/knowledge/{fact_id}")
+async def api_delete_knowledge(fact_id: str):
+    import json
+    from pathlib import Path
+    path = Path(__file__).parent.parent / "memory" / "knowledge" / "facts.jsonl"
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    new_lines, deleted = [], False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            if json.loads(line).get("id") == fact_id:
+                deleted = True
+                continue
+        except Exception:
+            pass
+        new_lines.append(line)
+    if not deleted:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/logs")
+async def api_logs(file: str = "main", lines: int = 150, min_level: str = "INFO"):
+    import re
+    from bootstrap import state
+    LEVELS = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+    min_lvl = LEVELS.get(min_level.upper(), 1)
+
+    if file == "memory":
+        return JSONResponse(state.get_error_log()[-lines:])
+
+    _log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+    _files = {
+        "main":     os.path.join(_log_dir, state.get_log_file() or LOG_FILE_MAIN),  # this process's log
+        "web":      os.path.join(_log_dir, LOG_FILE_WEB),
+        "telegram": os.path.join(_log_dir, LOG_FILE_TELEGRAM),
+        "errors":   os.path.join(_log_dir, LOG_FILE_ERRORS),
+    }
+    path = _files.get(file)
+    if not path or not os.path.isfile(path):
+        return JSONResponse([])
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.readlines()
+    except Exception:
+        return JSONResponse([])
+
+    raw = raw[-(lines * 4):]  # read extra to survive filter
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.+?): (.+)$")
+    entries: list[dict] = []
+    current: dict | None = None
+
+    for line in raw:
+        line = line.rstrip()
+        m = pattern.match(line)
+        if m:
+            if current and LEVELS.get(current["level"], 0) >= min_lvl:
+                entries.append(current)
+            ts, level, module, message = m.groups()
+            current = {"ts": ts, "level": level, "module": module, "message": message, "trace": ""}
+        elif current and line.strip():
+            current["trace"] = (current["trace"] + "\n" + line).strip()
+
+    if current and LEVELS.get(current["level"], 0) >= min_lvl:
+        entries.append(current)
+
+    return JSONResponse(list(reversed(entries[-lines:])))  # newest first
+
+
+@app.patch("/api/control/model")
+async def api_set_model(body: SetModelBody):
+    from bootstrap import state
+    state.set_model_override(body.model or None)
+    llm_cfg = state.get_config().get("llm", {})
+    active = body.model or llm_cfg.get("model", "unknown")
+    return JSONResponse({"ok": True, "model": active, "overridden": body.model is not None})
+
+
+@app.post("/api/control/stop")
+async def api_stop_task(body: StopTaskBody):
+    from bootstrap import state
+    if not body.session_id:
+        return JSONResponse({"ok": False, "error": "session_id required"}, status_code=400)
+    cancelled = state.cancel_task(body.session_id)
+    return JSONResponse({"ok": True, "cancelled": cancelled})
+
+
+@app.get("/api/agents")
+async def api_agents():
+    from thrall.tasks.task_disk import read_all
+    return JSONResponse(read_all())
+
+
+@app.delete("/api/agents/{task_id}")
+async def api_agents_kill(task_id: str):
+    from thrall.tasks.pool import cancel
+    from uuid import UUID
+    try:
+        uid = UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid task_id")
+    cancelled = await cancel(uid)
+    return JSONResponse({"ok": True, "cancelled": cancelled})
+
+
+@app.get("/api/scheduler")
+async def api_scheduler():
+    try:
+        from scheduler import store
+        jobs = store.load_jobs()
+        return JSONResponse([
+            {
+                "id": j.id,
+                "type": j.type,
+                "schedule": j.schedule,
+                "schedule_summary": j.schedule_summary(),
+                "task": j.task,
+                "enabled": j.enabled,
+                "last_run": j.last_run,
+                "agent": j.agent,
+            }
+            for j in jobs
+        ])
+    except Exception:
+        return JSONResponse([])
+
+
+@app.post("/api/scheduler/jobs")
+async def api_create_job(body: CreateJobBody):
+    import uuid
+    from datetime import datetime, timezone
+    from scheduler import store
+    from scheduler.job import Job
+    from scheduler.parser import parse_schedule
+    try:
+        result = await parse_schedule(body.schedule)
+        job = Job(
+            id=str(uuid.uuid4()),
+            type=body.type,
+            schedule=body.schedule,
+            cron_expr=result.cron_expr,
+            human_summary=result.human_summary,
+            task=body.task,
+            agent=body.agent,
+            output_mode=body.output_mode,
+            enabled=True,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        store.add_job(job)
+        return JSONResponse(job.to_dict(), status_code=201)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"Internal error: {e}"}, status_code=500)
+
+
+@app.delete("/api/scheduler/jobs/{job_id}")
+async def api_delete_job(job_id: str):
+    from scheduler import store
+    deleted = store.delete_job(job_id)
+    if not deleted:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+@app.patch("/api/scheduler/jobs/{job_id}/toggle")
+async def api_toggle_job(job_id: str):
+    from scheduler import store
+    toggled = store.toggle_job(job_id)
+    if not toggled:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    jobs = store.load_jobs()
+    job = next((j for j in jobs if j.id == job_id), None)
+    return JSONResponse({"ok": True, "enabled": job.enabled if job else None})
+
+
+@app.get("/api/commands")
+async def api_commands():
+    from commands.registry import all_commands
+    return JSONResponse([
+        {"name": cmd.name(), "description": cmd.description()}
+        for cmd in sorted(all_commands(), key=lambda c: c.name())
+    ])
+
+
+@app.get("/api/profiles")
+async def api_profiles():
+    from services.llm.router import list_profiles
+    return JSONResponse(list(list_profiles().keys()))
+
+
+class AuthBody(BaseModel):
+    profile: str  # e.g. "openai"
+
+
+@app.post("/api/auth/start")
+async def api_auth_start(body: AuthBody):
+    """Start OAuth PKCE flow for a credential profile. Returns the auth URL."""
+    if body.profile == "openai":
+        from services.auth import oauth_openai
+        import asyncio, time
+
+        url_holder: list[str] = []
+
+        def _capture(url: str) -> None:
+            url_holder.append(url)
+
+        asyncio.create_task(_run_openai_auth(oauth_openai, _capture))
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if url_holder:
+                break
+
+        if not url_holder:
+            return JSONResponse({"error": "Failed to start OAuth server"}, status_code=500)
+        return JSONResponse({"auth_url": url_holder[0]})
+
+    return JSONResponse({"error": f"No OAuth handler for profile '{body.profile}'"}, status_code=400)
+
+
+async def _run_openai_auth(oauth_openai, on_url) -> None:
+    import time
+    try:
+        tokens = await oauth_openai.run_pkce_flow(on_url)
+        from services.auth import credentials
+        credentials.write_oauth(
+            profile_name="openai",
+            access_token=tokens["access_token"],
+            refresh_token=tokens.get("refresh_token", ""),
+            expires_at=tokens.get("expires_at", int(time.time()) + 3600),
+            account_id=tokens.get("account_id", ""),
+        )
+        import logging
+        logging.getLogger(__name__).info("OpenAI Codex OAuth complete")
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("OpenAI Codex OAuth failed: %s", exc)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    from transports.desktop.handler import handle
+    await handle(ws)
+
+
+# Serve built React app — only if dist/ exists (production mode)
+_dist = os.path.join(os.path.dirname(__file__), "..", "dashboard", "dist")
+if os.path.isdir(_dist):
+    app.mount("/", StaticFiles(directory=_dist, html=True), name="static")

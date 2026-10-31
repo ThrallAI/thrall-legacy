@@ -1,0 +1,162 @@
+import { create } from 'zustand';
+import type { WsStatus } from './ws';
+
+export type MsgRole = 'user' | 'assistant';
+export type Panel = 'chat' | 'control' | 'agents' | 'scheduler' | 'logs' | 'memory' | 'sessions';
+
+export interface ChatMessage {
+  id: string;
+  role: MsgRole;
+  content: string;
+  ts: number;
+}
+
+export interface Session {
+  id: string;
+  name: string;
+  messages: ChatMessage[];
+  createdAt: number;
+}
+
+function _loadSessions(): Session[] {
+  try {
+    const raw = localStorage.getItem('thrall_sessions');
+    if (raw) return JSON.parse(raw) as Session[];
+  } catch {}
+  return [];
+}
+
+function _saveSessions(sessions: Session[]): void {
+  try {
+    localStorage.setItem('thrall_sessions', JSON.stringify(sessions));
+  } catch {}
+}
+
+function _makeSession(name = 'New chat'): Session {
+  return { id: crypto.randomUUID(), name, messages: [], createdAt: Date.now() };
+}
+
+const _saved = _loadSessions();
+const _initSessions = _saved.length > 0 ? _saved : [_makeSession('Chat')];
+const _initActiveId = _initSessions[0].id;
+
+interface Store {
+  messages: ChatMessage[];
+  wsStatus: WsStatus;
+  typingSessions: string[];
+  /** Live steps per session while Thrall is working (cleared when it stops typing). */
+  progressBySession: Record<string, string[]>;
+  sessionId: string | null;
+  activePanel: Panel;
+  sessions: Session[];
+  activeSessionId: string;
+
+  addMessage: (role: MsgRole, content: string, targetSessionId?: string | null) => void;
+  setWsStatus: (s: WsStatus) => void;
+  setTyping: (sessionId: string | null, isTyping: boolean) => void;
+  addProgress: (sessionId: string | null, text: string) => void;
+  setSessionId: (id: string) => void;
+  setPanel: (p: Panel) => void;
+  clearChat: () => void;
+  newSession: () => void;
+  switchSession: (id: string) => void;
+  renameSession: (id: string, name: string) => void;
+  deleteSession: (id: string) => void;
+}
+
+export const useStore = create<Store>((set) => ({
+  messages: _initSessions.find((s) => s.id === _initActiveId)?.messages ?? [],
+  wsStatus: 'disconnected',
+  typingSessions: [],
+  progressBySession: {},
+  sessionId: null,
+  activePanel: 'chat',
+  sessions: _initSessions,
+  activeSessionId: _initActiveId,
+
+  addMessage: (role, content, targetSessionId) => {
+    const msg: ChatMessage = { id: crypto.randomUUID(), role, content, ts: Date.now() };
+    set((s) => {
+      const writeToId = targetSessionId ?? s.activeSessionId;
+      const sessions = s.sessions.map((sess) => {
+        if (sess.id !== writeToId) return sess;
+        const updated = { ...sess, messages: [...sess.messages, msg] };
+        if (role === 'user' && sess.messages.length === 0 && sess.name === 'New chat') {
+          updated.name = content.slice(0, 28) + (content.length > 28 ? '…' : '');
+        }
+        return updated;
+      });
+      _saveSessions(sessions);
+      // Only update visible messages if writing to the active session
+      const messages = writeToId === s.activeSessionId ? [...s.messages, msg] : s.messages;
+      return { sessions, messages };
+    });
+  },
+
+  setWsStatus: (wsStatus) => set({ wsStatus }),
+  setTyping: (sessionId, isTyping) => set((s) => {
+    const typingSessions = isTyping
+      ? sessionId && !s.typingSessions.includes(sessionId) ? [...s.typingSessions, sessionId] : s.typingSessions
+      : sessionId ? s.typingSessions.filter((id) => id !== sessionId) : [];
+    if (isTyping) return { typingSessions };
+    // Task over — drop its live steps
+    const progressBySession = { ...s.progressBySession };
+    if (sessionId) delete progressBySession[sessionId];
+    return { typingSessions, progressBySession: sessionId ? progressBySession : {} };
+  }),
+  addProgress: (sessionId, text) => set((s) => {
+    const id = sessionId ?? s.activeSessionId;
+    const steps = s.progressBySession[id] ?? [];
+    if (steps[steps.length - 1] === text) return {};
+    return { progressBySession: { ...s.progressBySession, [id]: [...steps, text] } };
+  }),
+  setSessionId: (sessionId) => set({ sessionId }),
+  setPanel: (activePanel) => set({ activePanel }),
+
+  clearChat: () =>
+    set((s) => {
+      const sessions = s.sessions.map((sess) =>
+        sess.id === s.activeSessionId ? { ...sess, messages: [] } : sess,
+      );
+      _saveSessions(sessions);
+      return { sessions, messages: [] };
+    }),
+
+  newSession: () =>
+    set((s) => {
+      const sess = _makeSession();
+      const sessions = [...s.sessions, sess];
+      _saveSessions(sessions);
+      return { sessions, activeSessionId: sess.id, messages: [] };
+    }),
+
+  switchSession: (id) =>
+    set((s) => {
+      const sess = s.sessions.find((x) => x.id === id);
+      if (!sess) return {};
+      return { activeSessionId: id, messages: sess.messages };
+    }),
+
+  renameSession: (id, name) =>
+    set((s) => {
+      const sessions = s.sessions.map((sess) =>
+        sess.id === id ? { ...sess, name } : sess,
+      );
+      _saveSessions(sessions);
+      return { sessions };
+    }),
+
+  deleteSession: (id) =>
+    set((s) => {
+      const sessions = s.sessions.filter((sess) => sess.id !== id);
+      if (sessions.length === 0) {
+        const fresh = _makeSession('Chat');
+        _saveSessions([fresh]);
+        return { sessions: [fresh], activeSessionId: fresh.id, messages: [] };
+      }
+      const nextId = s.activeSessionId === id ? sessions[0].id : s.activeSessionId;
+      const nextMsgs = sessions.find((sess) => sess.id === nextId)?.messages ?? [];
+      _saveSessions(sessions);
+      return { sessions, activeSessionId: nextId, messages: nextMsgs };
+    }),
+}));

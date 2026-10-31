@@ -1,0 +1,59 @@
+import { useEffect, useRef } from 'react';
+import { useStore } from './store';
+import { createWsClient } from './ws';
+import type { WsClient } from './ws';
+import Sidebar from './components/Sidebar';
+import Chat from './components/Chat';
+import ControlPanel from './components/ControlPanel';
+import AgentsPanel from './components/AgentsPanel';
+import SchedulerPanel from './components/SchedulerPanel';
+import LogsPanel from './components/LogsPanel';
+import MemoryPanel from './components/MemoryPanel';
+import SessionsPanel from './components/SessionsPanel';
+
+export default function App() {
+  const { activePanel, setWsStatus, setTyping, addMessage, addProgress, setSessionId, activeSessionId, typingSessions, progressBySession } = useStore();
+  const wsRef = useRef<WsClient | null>(null);
+
+  useEffect(() => {
+    const token = (import.meta as unknown as { env: Record<string, string> }).env.VITE_THRALL_TOKEN ?? '';
+    const client = createWsClient(token, {
+      onStatus: setWsStatus,
+      onTyping: (sessionId) => setTyping(sessionId, true),
+      onMessage: (content, sessionId) => { addMessage('assistant', content, sessionId); setTyping(sessionId, false); },
+      onSync: (role, content) => addMessage(role, content),
+      onProgress: (text, sessionId) => addProgress(sessionId, text),
+      onNotice: (content, sessionId) => addMessage('assistant', content, sessionId),
+      onError: (msg) => { addMessage('assistant', `[error] ${msg}`); setTyping(null, false); },
+      onSessionId: setSessionId,
+    });
+    wsRef.current = client;
+    client.connect();
+    return () => client.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function sendMessage(content: string) {
+    addMessage('user', content);
+    wsRef.current?.send(content, activeSessionId);
+  }
+
+  return (
+    <div className="flex h-screen bg-base text-primary overflow-hidden">
+      <Sidebar />
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Chat stays mounted so messages are never lost on panel switch */}
+        <div className={activePanel === 'chat' ? 'flex flex-col flex-1 min-h-0' : 'hidden'}>
+          <Chat onSend={sendMessage} typing={typingSessions.includes(activeSessionId)}
+                progress={progressBySession[activeSessionId] ?? []} />
+        </div>
+        {activePanel === 'control' && <ControlPanel />}
+        {activePanel === 'agents' && <AgentsPanel />}
+        {activePanel === 'scheduler' && <SchedulerPanel />}
+        {activePanel === 'logs' && <LogsPanel />}
+        {activePanel === 'memory' && <MemoryPanel />}
+        {activePanel === 'sessions' && <SessionsPanel />}
+      </div>
+    </div>
+  );
+}
